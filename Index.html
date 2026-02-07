@@ -1,0 +1,677 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>RP Map</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <link rel="stylesheet" href="./style.css"/>
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar" class="open">
+    <div class="row">
+      <div>
+        <h1>RP Map</h1>
+        <div class="sub" id="modeLine">Viewer mode</div>
+      </div>
+      <button id="toggleSidebar">☰</button>
+    </div>
+
+    <div class="section">
+      <label class="label">Search</label>
+      <input id="search" class="input" placeholder="Search houses, POIs, roads, counties..."/>
+    </div>
+
+    <div class="grid2 section">
+      <div>
+        <label class="label">Mode</label>
+        <select id="mode" class="input">
+          <option value="inspect">Inspect (Viewer)</option>
+          <option value="select">Select / Move</option>
+          <option value="marker">Place Marker</option>
+          <option value="road">Draw Road</option>
+          <option value="area">Draw Area (County)</option>
+          <option value="erase">Delete</option>
+        </select>
+      </div>
+      <div>
+        <label class="label">Color</label>
+        <input id="color" class="input" type="color" value="#00E5FF"/>
+      </div>
+    </div>
+
+    <div class="grid2 section">
+      <div>
+        <label class="label">Marker Type</label>
+        <select id="markerType" class="input">
+          <option value="house">🏠 House #</option>
+          <option value="poi">📍 POI</option>
+          <option value="shop">🛒 Shop</option>
+          <option value="sheriff">⭐ Sheriff</option>
+          <option value="doctor">🩺 Doctor</option>
+          <option value="stable">🐴 Stable</option>
+          <option value="camp">⛺ Camp</option>
+          <option value="bank">🏦 Bank</option>
+          <option value="saloon">🍻 Saloon</option>
+          <option value="train">🚂 Train</option>
+          <option value="custom">✨ Custom</option>
+        </select>
+      </div>
+      <div>
+        <label class="label">House #</label>
+        <input id="houseNum" class="input" placeholder="Auto"/>
+      </div>
+    </div>
+
+    <div class="grid2 section">
+      <button id="finishRoad" class="btn">Finish Road</button>
+      <button id="undoPoint" class="btn">Undo Point</button>
+    </div>
+
+    <div class="grid2 section">
+      <button id="finishArea" class="btn">Finish Area</button>
+      <button id="closeLoop" class="btn">Close Loop</button>
+    </div>
+
+    <div class="grid2 section">
+      <button id="deleteSelected" class="btn danger">Delete Selected</button>
+      <button id="clearSelect" class="btn">Clear Select</button>
+    </div>
+
+    <div class="grid2 section">
+      <button id="resetView" class="btn">Reset View</button>
+      <button id="export" class="btn">Export</button>
+    </div>
+
+    <div class="section">
+      <textarea id="box" class="box" placeholder="Export JSON here..."></textarea>
+    </div>
+
+    <div class="status">
+      <span id="savePill" class="pill">Saved</span>
+      <span id="metaLine">0 markers • 0 roads • 0 areas</span>
+    </div>
+  </aside>
+
+  <main id="main">
+    <div id="map"></div>
+
+    <div class="zoomHud">
+      <button class="hud-btn" id="zIn">＋</button>
+      <button class="hud-btn" id="zOut">－</button>
+      <button class="hud-btn" id="zHome">⌂</button>
+    </div>
+
+    <div class="authHud">
+      <button class="authBtn" id="loginBtn">🔒 Log in</button>
+      <button class="authBtn hidden" id="logoutBtn">🚪 Log out</button>
+      <div class="who hidden" id="who"></div>
+    </div>
+
+    <div class="cursorHalo hidden" id="halo"></div>
+  </main>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+/** ====== CONFIG ====== **/
+const MAP_ID = "rdo_main";
+const MAP_IMAGE_URL = "./assets/map.jpg";
+
+// IMPORTANT: set these to your image pixel size (must match file)
+const MAP_W = 1080;
+const MAP_H = 1017;
+
+// If true, autosave goes to /api/save (global). If false, local only.
+const USE_API = true;
+
+/** ====== STATE ====== **/
+let canEdit = false;
+let me = null;
+
+let data = { markers: [], roads: [], areas: [] };
+// markers: {id, kind, x,y, color, title, desc, emoji, houseNum}
+// roads: {id, color, pts:[[y,x]...], title, desc}
+// areas: {id, color, pts:[[y,x]...], title, desc, kind:'county'}
+
+const STORAGE_KEY = "rp_map_local_cache_v3";
+
+const el = (id)=>document.getElementById(id);
+
+let mode = el("mode").value;
+let currentLinePts = [];
+let currentLineLayer = null;
+let currentAreaPts = [];
+let currentAreaLayer = null;
+
+let selected = null; // {type:'marker'|'road'|'area', id, layer}
+
+let saveTimer = null;
+let isSaving = false;
+
+/** ====== UI helpers ====== **/
+function setSaved(ok){
+  el("savePill").textContent = ok ? "Saved" : "Saving...";
+}
+function updateMeta(){
+  el("metaLine").textContent = `${data.markers.length} markers • ${data.roads.length} roads • ${data.areas.length} areas`;
+}
+function setModeLine(){
+  const txt = canEdit ? "Editor enabled" : "Viewer only";
+  el("modeLine").textContent = `${txt} • Mode: ${mode}`;
+}
+
+/** ====== Leaflet map ====== **/
+const map = L.map("map", {
+  crs: L.CRS.Simple,
+  minZoom: -3,
+  maxZoom: 4,
+  zoomSnap: 0.25,
+  zoomDelta: 0.5,
+  wheelDebounceTime: 20,
+  wheelPxPerZoomLevel: 80
+});
+
+const bounds = [[0,0],[MAP_H, MAP_W]];
+L.imageOverlay(MAP_IMAGE_URL, bounds).addTo(map);
+map.fitBounds(bounds);
+
+const roadsLayer = L.layerGroup().addTo(map);
+const areasLayer = L.layerGroup().addTo(map);
+const markersLayer = L.layerGroup().addTo(map);
+
+/** ====== Cursor halo for visibility ====== **/
+const halo = el("halo");
+el("main").addEventListener("mousemove", (e)=>{
+  halo.classList.remove("hidden");
+  halo.style.left = e.clientX + "px";
+  halo.style.top = e.clientY + "px";
+});
+el("main").addEventListener("mouseleave", ()=>halo.classList.add("hidden"));
+
+function setHaloMode(){
+  halo.classList.toggle("erase", mode==="erase");
+}
+
+/** ====== ID helpers ====== **/
+function nextId(arr){
+  let n = 1;
+  const s = new Set(arr.map(x=>x.id));
+  while(s.has(n)) n++;
+  return n;
+}
+
+/** ====== Icons ====== **/
+const emojiMap = {
+  house:"🏠", poi:"📍", shop:"🛒", sheriff:"⭐", doctor:"🩺", stable:"🐴",
+  camp:"⛺", bank:"🏦", saloon:"🍻", train:"🚂", custom:"✨"
+};
+function markerIcon(m){
+  const emoji = m.emoji || emojiMap[m.kind] || "📍";
+  const color = m.color || "#00E5FF";
+  const label = (m.kind==="house") ? String(m.houseNum || m.id) : emoji;
+
+  return L.divIcon({
+    className:"",
+    html: `
+      <div style="
+        width:30px;height:30px;border-radius:999px;
+        display:grid;place-items:center;
+        border:2px solid ${color};
+        background:rgba(0,0,0,.45);
+        color:${color};
+        font:900 14px/1 system-ui;
+        box-shadow:0 2px 12px rgba(0,0,0,.45);
+        user-select:none;
+      ">${label}</div>
+    `,
+    iconSize:[30,30],
+    iconAnchor:[15,15]
+  });
+}
+
+function popupHtml(title, desc){
+  const t = String(title||"").trim();
+  const d = String(desc||"").trim();
+  return `
+    <div style="min-width:220px">
+      <div style="font-weight:900;margin-bottom:6px">${escapeHtml(t||"Info")}</div>
+      <div style="opacity:.85;font-size:12px;line-height:1.35">${escapeHtml(d||"No description yet.")}</div>
+      ${canEdit ? `<div style="opacity:.65;font-size:11px;margin-top:8px">(Right click / long-press to edit)</div>` : ``}
+    </div>
+  `;
+}
+function escapeHtml(str){
+  return String(str||"")
+    .replaceAll("&","&amp;")
+    .replaceAll("<","&lt;")
+    .replaceAll(">","&gt;")
+    .replaceAll('"',"&quot;")
+    .replaceAll("'","&#039;");
+}
+
+/** ====== Selection ====== **/
+function clearSelectedStyle(){
+  if(!selected) return;
+  if(selected.type==="road") selected.layer.setStyle({weight:4, opacity:0.9});
+  if(selected.type==="area") selected.layer.setStyle({weight:3, opacity:0.35, fillOpacity:0.12});
+}
+function setSelected(sel){
+  clearSelectedStyle();
+  selected = sel || null;
+  if(!selected) return;
+  if(selected.type==="road") selected.layer.setStyle({weight:7, opacity:1});
+  if(selected.type==="area") selected.layer.setStyle({weight:5, opacity:0.55, fillOpacity:0.18});
+}
+
+/** ====== Render ====== **/
+function renderAll(){
+  roadsLayer.clearLayers();
+  areasLayer.clearLayers();
+  markersLayer.clearLayers();
+
+  // Areas (counties)
+  data.areas.forEach((a)=>{
+    const poly = L.polygon(a.pts, {
+      color: a.color || "#00E5FF",
+      weight:3,
+      opacity:0.55,
+      fillOpacity:0.12
+    }).addTo(areasLayer);
+
+    poly.bindPopup(popupHtml(a.title || "Area", a.desc || ""));
+
+    poly.on("click",(e)=>{
+      if(mode!=="inspect" && mode!=="select" && mode!=="erase") return;
+      L.DomEvent.stopPropagation(e);
+      setSelected({type:"area", id:a.id, layer:poly});
+      if(mode==="erase" && canEdit) deleteSelected();
+    });
+  });
+
+  // Roads
+  data.roads.forEach((r)=>{
+    const line = L.polyline(r.pts, {
+      color: r.color || "#00E5FF",
+      weight:4,
+      opacity:0.9
+    }).addTo(roadsLayer);
+
+    line.bindPopup(popupHtml(r.title || "Road", r.desc || ""));
+
+    line.on("click",(e)=>{
+      if(mode!=="inspect" && mode!=="select" && mode!=="erase") return;
+      L.DomEvent.stopPropagation(e);
+      setSelected({type:"road", id:r.id, layer:line});
+      if(mode==="erase" && canEdit) deleteSelected();
+    });
+  });
+
+  // Markers
+  data.markers.forEach((m)=>{
+    const marker = L.marker([m.y, m.x], {
+      icon: markerIcon(m),
+      draggable: canEdit && (mode==="select")
+    }).addTo(markersLayer);
+
+    marker.bindPopup(popupHtml(m.title || (m.kind==="house" ? `House #${m.houseNum||m.id}` : "Marker"), m.desc || ""));
+
+    marker.on("click",(e)=>{
+      if(mode!=="inspect" && mode!=="select" && mode!=="erase") return;
+      L.DomEvent.stopPropagation(e);
+      setSelected({type:"marker", id:m.id, layer:marker});
+      if(mode==="erase" && canEdit) deleteSelected();
+    });
+
+    marker.on("dragend", ()=>{
+      const p = marker.getLatLng();
+      m.y = Math.round(p.lat);
+      m.x = Math.round(p.lng);
+      scheduleSave();
+    });
+
+    // edit popup (desktop right click)
+    marker.on("contextmenu",(e)=>{
+      if(!canEdit || mode!=="select") return;
+      L.DomEvent.stopPropagation(e);
+      editMarker(m, marker);
+    });
+
+    // long press mobile
+    let press=null;
+    marker.on("mousedown", ()=>{
+      if(!canEdit || mode!=="select") return;
+      press = setTimeout(()=>editMarker(m, marker), 550);
+    });
+    marker.on("mouseup", ()=>press && clearTimeout(press));
+    marker.on("mouseout", ()=>press && clearTimeout(press));
+  });
+
+  updateMeta();
+  setModeLine();
+}
+
+/** ====== Edit dialogs ====== **/
+function editMarker(m, layer){
+  const t = prompt("Title:", m.title || "") ?? (m.title||"");
+  const d = prompt("Description:", m.desc || "") ?? (m.desc||"");
+  const c = prompt("Color hex (#00E5FF):", m.color || el("color").value || "#00E5FF") ?? (m.color||"#00E5FF");
+  const em = prompt("Emoji (optional):", m.emoji || "") ?? (m.emoji||"");
+
+  m.title = String(t).trim();
+  m.desc = String(d).trim();
+  m.color = String(c).trim() || "#00E5FF";
+  m.emoji = String(em).trim();
+
+  layer.setIcon(markerIcon(m));
+  layer.setPopupContent(popupHtml(m.title, m.desc));
+  scheduleSave();
+}
+
+function editLineOrArea(obj, layer, label){
+  const t = prompt(`${label} title:`, obj.title || "") ?? (obj.title||"");
+  const d = prompt(`${label} description:`, obj.desc || "") ?? (obj.desc||"");
+  obj.title = String(t).trim();
+  obj.desc = String(d).trim();
+  layer.setPopupContent(popupHtml(obj.title, obj.desc));
+  scheduleSave();
+}
+
+/** ====== Delete selected ====== **/
+function deleteSelected(){
+  if(!canEdit) return alert("Log in to edit.");
+  if(!selected) return;
+
+  if(selected.type==="marker"){
+    data.markers = data.markers.filter(x=>x.id!==selected.id);
+  } else if(selected.type==="road"){
+    data.roads = data.roads.filter(x=>x.id!==selected.id);
+  } else if(selected.type==="area"){
+    data.areas = data.areas.filter(x=>x.id!==selected.id);
+  }
+  setSelected(null);
+  renderAll();
+  scheduleSave();
+}
+
+/** ====== Saving/loading ====== **/
+function loadLocal(){
+  try{
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if(!raw) return;
+    const parsed = JSON.parse(raw);
+    if(parsed && typeof parsed==="object"){
+      data = {
+        markers: Array.isArray(parsed.markers)?parsed.markers:[],
+        roads: Array.isArray(parsed.roads)?parsed.roads:[],
+        areas: Array.isArray(parsed.areas)?parsed.areas:[]
+      };
+    }
+  }catch{}
+}
+
+function saveLocal(){
+  try{
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  }catch{}
+}
+
+function scheduleSave(){
+  setSaved(false);
+  saveLocal();
+
+  if(saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(async ()=>{
+    if(!USE_API) { setSaved(true); return; }
+    if(!canEdit) { setSaved(true); return; }
+
+    try{
+      isSaving = true;
+      const r = await fetch(`/api/save`, {
+        method:"POST",
+        headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify({ mapId: MAP_ID, payload: data, message:`Auto-save ${MAP_ID}` })
+      });
+      const j = await r.json().catch(()=>null);
+      if(!r.ok) throw new Error(j?.error || "Save failed");
+      setSaved(true);
+    }catch(e){
+      setSaved(true);
+      console.warn(e);
+      alert("Save failed (check Vercel env vars + auth).");
+    }finally{
+      isSaving = false;
+    }
+  }, 600);
+}
+
+async function loadFromApi(){
+  try{
+    const r = await fetch(`/api/load?mapId=${encodeURIComponent(MAP_ID)}`);
+    const j = await r.json();
+    if(j?.payload) data = j.payload;
+  }catch(e){
+    console.warn(e);
+  }
+}
+
+/** ====== Auth ====== **/
+async function refreshMe(){
+  try{
+    const r = await fetch("/api/me");
+    const j = await r.json();
+    me = j?.user || null;
+    canEdit = !!j?.canEdit;
+
+    el("loginBtn").classList.toggle("hidden", !!me);
+    el("logoutBtn").classList.toggle("hidden", !me);
+    el("who").classList.toggle("hidden", !me);
+    el("who").textContent = me ? `Signed in: ${me.username} (${canEdit ? "Editor" : "Viewer"})` : "";
+
+    // Force viewer mode if not allowed
+    if(!canEdit){
+      if(mode!=="inspect") el("mode").value = "inspect";
+      mode = "inspect";
+    }
+    setModeLine();
+    renderAll();
+  }catch{
+    me = null; canEdit = false;
+  }
+}
+
+/** ====== Map interactions ====== **/
+el("mode").addEventListener("change", ()=>{
+  const newMode = el("mode").value;
+
+  // if they try to pick edit modes without permission, bounce
+  const needsEdit = ["select","marker","road","area","erase"].includes(newMode);
+  if(needsEdit && !canEdit){
+    el("mode").value = "inspect";
+    mode = "inspect";
+    alert("Viewer only. Log in with Discord to edit.");
+  } else {
+    mode = newMode;
+  }
+
+  // delete mode: set color black
+  if(mode==="erase") el("color").value = "#000000";
+
+  // cancel draw
+  currentLinePts = [];
+  if(currentLineLayer){ map.removeLayer(currentLineLayer); currentLineLayer=null; }
+  currentAreaPts = [];
+  if(currentAreaLayer){ map.removeLayer(currentAreaLayer); currentAreaLayer=null; }
+
+  setSelected(null);
+  setHaloMode();
+  setModeLine();
+  renderAll();
+});
+
+map.on("click",(e)=>{
+  const y = Math.round(e.latlng.lat);
+  const x = Math.round(e.latlng.lng);
+
+  if(mode==="inspect"){
+    setSelected(null);
+    return;
+  }
+
+  if(!canEdit) return;
+
+  if(mode==="marker"){
+    const kind = el("markerType").value;
+    const color = el("color").value || "#00E5FF";
+    const id = nextId(data.markers);
+
+    let houseNum = null;
+    if(kind==="house"){
+      const raw = String(el("houseNum").value || "").trim();
+      houseNum = raw ? raw : String(id);
+    }
+
+    const title = prompt("Title:", kind==="house" ? `House #${houseNum}` : "POI") || "";
+    const desc = prompt("Description:", "") || "";
+
+    data.markers.push({
+      id,
+      kind,
+      x,y,
+      color,
+      title:title.trim(),
+      desc:desc.trim(),
+      emoji:"",
+      houseNum
+    });
+    renderAll();
+    scheduleSave();
+    return;
+  }
+
+  if(mode==="road"){
+    currentLinePts.push([y,x]);
+    if(currentLineLayer) map.removeLayer(currentLineLayer);
+    currentLineLayer = L.polyline(currentLinePts, { weight:4, opacity:0.95, color: el("color").value || "#00E5FF" }).addTo(map);
+    return;
+  }
+
+  if(mode==="area"){
+    currentAreaPts.push([y,x]);
+    if(currentAreaLayer) map.removeLayer(currentAreaLayer);
+    currentAreaLayer = L.polygon(currentAreaPts, { weight:3, opacity:0.6, color: el("color").value || "#00E5FF", fillOpacity:0.12 }).addTo(map);
+    return;
+  }
+
+  if(mode==="select"){
+    setSelected(null);
+  }
+});
+
+/** ====== Buttons ====== **/
+el("toggleSidebar").onclick = ()=>{
+  el("sidebar").classList.toggle("closed");
+};
+
+el("finishRoad").onclick = ()=>{
+  if(!canEdit) return alert("Log in to edit.");
+  if(mode!=="road") return alert('Switch to "Draw Road" first.');
+  if(currentLinePts.length < 2) return alert("Add at least 2 points.");
+
+  const id = nextId(data.roads);
+  const obj = { id, color: el("color").value || "#00E5FF", pts: currentLinePts, title:"", desc:"" };
+  data.roads.push(obj);
+
+  currentLinePts = [];
+  if(currentLineLayer){ map.removeLayer(currentLineLayer); currentLineLayer=null; }
+
+  renderAll();
+  scheduleSave();
+
+  // optional immediate edit
+  const layer = L.polyline(obj.pts, {color:obj.color, weight:4, opacity:0.9}).addTo(roadsLayer);
+  editLineOrArea(obj, layer, "Road");
+};
+
+el("undoPoint").onclick = ()=>{
+  if(!canEdit) return alert("Log in to edit.");
+  if(mode==="road" && currentLinePts.length){
+    currentLinePts.pop();
+    if(currentLineLayer) map.removeLayer(currentLineLayer);
+    currentLineLayer = currentLinePts.length
+      ? L.polyline(currentLinePts, { weight:4, opacity:0.95, color: el("color").value || "#00E5FF" }).addTo(map)
+      : null;
+  }
+  if(mode==="area" && currentAreaPts.length){
+    currentAreaPts.pop();
+    if(currentAreaLayer) map.removeLayer(currentAreaLayer);
+    currentAreaLayer = currentAreaPts.length
+      ? L.polygon(currentAreaPts, { weight:3, opacity:0.6, color: el("color").value || "#00E5FF", fillOpacity:0.12 }).addTo(map)
+      : null;
+  }
+};
+
+el("finishArea").onclick = ()=>{
+  if(!canEdit) return alert("Log in to edit.");
+  if(mode!=="area") return alert('Switch to "Draw Area" first.');
+  if(currentAreaPts.length < 3) return alert("Need at least 3 points.");
+
+  const id = nextId(data.areas);
+  const obj = { id, color: el("color").value || "#00E5FF", pts: currentAreaPts, title:"", desc:"", kind:"county" };
+  data.areas.push(obj);
+
+  currentAreaPts = [];
+  if(currentAreaLayer){ map.removeLayer(currentAreaLayer); currentAreaLayer=null; }
+
+  renderAll();
+  scheduleSave();
+
+  // optional immediate edit
+  const layer = L.polygon(obj.pts, {color:obj.color, weight:3, opacity:0.55, fillOpacity:0.12}).addTo(areasLayer);
+  editLineOrArea(obj, layer, "Area");
+};
+
+el("closeLoop").onclick = ()=>{
+  if(mode==="road" && currentLinePts.length>2){
+    currentLinePts.push(currentLinePts[0]);
+    if(currentLineLayer) map.removeLayer(currentLineLayer);
+    currentLineLayer = L.polyline(currentLinePts, { weight:4, opacity:0.95, color: el("color").value || "#00E5FF" }).addTo(map);
+  }
+  if(mode==="area" && currentAreaPts.length>2){
+    currentAreaPts.push(currentAreaPts[0]);
+    if(currentAreaLayer) map.removeLayer(currentAreaLayer);
+    currentAreaLayer = L.polygon(currentAreaPts, { weight:3, opacity:0.6, color: el("color").value || "#00E5FF", fillOpacity:0.12 }).addTo(map);
+  }
+};
+
+el("deleteSelected").onclick = deleteSelected;
+el("clearSelect").onclick = ()=>setSelected(null);
+el("resetView").onclick = ()=>map.fitBounds(bounds);
+
+el("export").onclick = ()=>{
+  el("box").value = JSON.stringify(data, null, 2);
+};
+
+el("zIn").onclick = ()=>map.setZoom(map.getZoom()+0.5);
+el("zOut").onclick = ()=>map.setZoom(map.getZoom()-0.5);
+el("zHome").onclick = ()=>map.fitBounds(bounds);
+
+el("loginBtn").onclick = ()=>{ window.location.href = "/api/login"; };
+el("logoutBtn").onclick = async ()=>{
+  await fetch("/api/logout");
+  await refreshMe();
+};
+
+/** ====== Boot ====== **/
+(async ()=>{
+  loadLocal();
+  if(USE_API) await loadFromApi();
+  renderAll();
+  setSaved(true);
+  setHaloMode();
+  await refreshMe();
+})();
+</script>
+</body>
+</html>
