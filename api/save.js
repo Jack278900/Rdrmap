@@ -1,21 +1,88 @@
- import crypto from "crypto";
+// api/save.js
+import crypto from "crypto";
 
-function b64url(buf){ return Buffer.from(buf).toString("base64").replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,""); }
-function verifySession(token, secret){
-  const [p,s] = String(token||"").split(".");
-  if(!p||!s) return null;
-  const json = Buffer.from(p.replace(/-/g,"+").replace(/_/g,"/"), "base64").toString("utf8");
-  const expected = b64url(crypto.createHmac("sha256", secret).update(json).digest());
-  if(expected !== s) return null;
-  return JSON.parse(json);
+const COOKIE_NAME = "rp_session";
+
+/* =========================
+   Session helpers (clean)
+========================= */
+function base64urlEncode(input) {
+  return Buffer.from(input)
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
 }
-function getCookie(req, name){
-  const raw = req.headers.cookie || "";
-  const m = raw.match(new RegExp(`(?:^|; )${name}=([^;]*)`));
-  return m ? decodeURIComponent(m[1]) : null;
+
+function base64urlDecodeToString(b64url) {
+  const b64 = String(b64url).replace(/-/g, "+").replace(/_/g, "/");
+  // pad base64
+  const pad = b64.length % 4 ? "=".repeat(4 - (b64.length % 4)) : "";
+  return Buffer.from(b64 + pad, "base64").toString("utf8");
 }
+
+function hmacSha256Base64url(secret, message) {
+  const sig = crypto.createHmac("sha256", secret).update(message).digest();
+  return base64urlEncode(sig);
+}
+
+function parseCookies(req) {
+  const header = req.headers.cookie || "";
+  const out = {};
+  header.split(";").forEach((part) => {
+    const idx = part.indexOf("=");
+    if (idx === -1) return;
+    const k = part.slice(0, idx).trim();
+    const v = part.slice(idx + 1).trim();
+    out[k] = decodeURIComponent(v);
+  });
+  return out;
+}
+
+/**
+ * Our session token format (from /api/login):
+ *   base64url(JSON_PAYLOAD).base64url(HMAC_SHA256(JSON_PAYLOAD))
+ */
+function readSession(req) {
+  const secret = process.env.SESSION_SECRET || "";
+  if (!secret) return null;
+
+  const cookies = parseCookies(req);
+  const token = cookies[COOKIE_NAME];
+  if (!token) return null;
+
+  const [p, s] = String(token).split(".");
+  if (!p || !s) return null;
+
+  const json = base64urlDecodeToString(p);
+  const expected = hmacSha256Base64url(secret, json);
+  if (expected !== s) return null;
+
+  try {
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
+}
+
+function requireEditor(req, res) {
+  const session = readSession(req);
+  if (!session || !session.canEdit) {
+    res.status(401).json({ error: "Unauthorized" });
+    return null;
+  }
+  return session;
+}
+
+/* =========================
+   Main handler
+========================= */
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
+
+  // ✅ Discord auth gate (replaces the old x-editor-code header)
+  const session = requireEditor(req, res);
+  if (!session) return;
 
   try {
     const body = req.body || {};
@@ -33,13 +100,6 @@ export default async function handler(req, res) {
     const TOKEN = process.env.GITHUB_TOKEN;
     const BASE_PATH = process.env.GITHUB_BASE_PATH || "data/maps";
 
-    // Optional simple protection
-    const REQUIRED = process.env.EDITOR_CODE || "";
-    const got = String(req.headers["x-editor-code"] || "");
-    if (REQUIRED && got !== REQUIRED) {
-      return res.status(401).json({ error: "Unauthorized" });
-    }
-
     if (!OWNER || !REPO || !TOKEN) {
       return res.status(500).json({ error: "Missing env vars (GITHUB_OWNER/REPO/TOKEN)" });
     }
@@ -51,13 +111,18 @@ export default async function handler(req, res) {
     const contentObj = {
       mapId,
       updatedAt: new Date().toISOString(),
-      payload
+      updatedBy: {
+        id: session.id,
+        username: session.username,
+      },
+      payload,
     };
+
     const contentStr = JSON.stringify(contentObj, null, 2);
     const contentB64 = Buffer.from(contentStr, "utf8").toString("base64");
 
     // Get current sha (if exists)
-    let sha = undefined;
+    let sha;
     const getResp = await fetch(`${apiBase}?ref=${encodeURIComponent(BRANCH)}`, {
       headers: {
         Authorization: `Bearer ${TOKEN}`,
@@ -86,7 +151,7 @@ export default async function handler(req, res) {
       message: body.message || `Auto-save ${mapId}`,
       content: contentB64,
       branch: BRANCH,
-      ...(sha ? { sha } : {})
+      ...(sha ? { sha } : {}),
     };
 
     const putResp = await fetch(apiBase, {
@@ -106,9 +171,12 @@ export default async function handler(req, res) {
     }
 
     const out = await putResp.json();
-    return res.status(200).json({ ok: true, skipped: false, commit: out?.commit?.sha || null });
+    return res.status(200).json({
+      ok: true,
+      skipped: false,
+      commit: out?.commit?.sha || null,
+    });
   } catch (e) {
     return res.status(500).json({ error: String(e?.message || e) });
   }
 }
-
