@@ -2,7 +2,7 @@
    A Cowboy's Frontier – Map Editor (FINAL STABLE)
    ===================================================== */
 
-const MAP_IMAGE_URL = "./assets/rdo-maps.jpeg";
+const MAP_IMAGE_URL = "./assets/rdo-map.jpeg";
 const DATA_URL = "./data/maps/rdo_map.json";
 
 const TYPE_COLORS = {
