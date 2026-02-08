@@ -1,32 +1,20 @@
-import crypto from "crypto";
-
-function b64url(buf){ return Buffer.from(buf).toString("base64").replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,""); }
-function verifySession(token, secret){
-  const [p,s] = String(token||"").split(".");
-  if(!p||!s) return null;
-  const json = Buffer.from(p.replace(/-/g,"+").replace(/_/g,"/"), "base64").toString("utf8");
-  const expected = b64url(crypto.createHmac("sha256", secret).update(json).digest());
-  if(expected !== s) return null;
-  return JSON.parse(json);
-}
-function getCookie(req, name){
-  const raw = req.headers.cookie || "";
-  const m = raw.match(new RegExp(`(?:^|; )${name}=([^;]*)`));
-  return m ? decodeURIComponent(m[1]) : null;
-}
+import { json, mustEnv, getCookie, verifySession } from "./_lib.js";
 
 export default function handler(req, res){
-  const secret = process.env.SESSION_SECRET;
-  if(!secret) return res.status(500).json({ error:"Missing SESSION_SECRET" });
+  try{
+    const SESSION_SECRET = mustEnv("SESSION_SECRET");
+    const token = getCookie(req, "session");
+    if(!token) return json(res, 200, { loggedIn:false, editor:false });
 
-  const tok = getCookie(req, "rp_session");
-  if(!tok) return res.status(200).json({ user:null, canEdit:false });
+    const s = verifySession(token, SESSION_SECRET);
+    if(!s) return json(res, 200, { loggedIn:false, editor:false });
 
-  const session = verifySession(tok, secret);
-  if(!session) return res.status(200).json({ user:null, canEdit:false });
-
-  return res.status(200).json({
-    user: { id: session.id, username: session.username, avatar: session.avatar },
-    canEdit: !!session.canEdit
-  });
+    return json(res, 200, {
+      loggedIn: true,
+      editor: !!s.editor,
+      user: { id: s.uid, username: s.username }
+    });
+  }catch(e){
+    return json(res, 500, { error:String(e?.message || e) });
+  }
 }
