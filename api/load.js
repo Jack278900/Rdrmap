@@ -1,49 +1,37 @@
-export default async function handler(req, res) {
-  if (req.method !== "GET") return res.status(405).json({ error: "GET only" });
+import { json, mustEnv, normalizeMapId, gh } from "./_lib.js";
 
-  try {
-    const mapIdRaw = String(req.query.mapId || "rdo_main");
-    const mapId = mapIdRaw.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 64) || "rdo_main";
-
-    const OWNER = process.env.GITHUB_OWNER;
-    const REPO = process.env.GITHUB_REPO;
+export default async function handler(req, res){
+  try{
+    const OWNER = mustEnv("GITHUB_OWNER");
+    const REPO  = mustEnv("GITHUB_REPO");
+    const TOKEN = mustEnv("GITHUB_TOKEN");
     const BRANCH = process.env.GITHUB_BRANCH || "main";
-    const TOKEN = process.env.GITHUB_TOKEN;
     const BASE_PATH = process.env.GITHUB_BASE_PATH || "data/maps";
 
-    if (!OWNER || !REPO || !TOKEN) {
-      return res.status(500).json({ error: "Missing env vars (GITHUB_OWNER/REPO/TOKEN)" });
-    }
+    const url = new URL(req.url, `https://${req.headers.host}`);
+    const mapId = normalizeMapId(url.searchParams.get("mapId"));
 
     const path = `${BASE_PATH}/${mapId}.json`;
-    const url = `https://api.github.com/repos/${OWNER}/${REPO}/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(BRANCH)}`;
+    const apiUrl = `https://api.github.com/repos/${OWNER}/${REPO}/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(BRANCH)}`;
 
-    const r = await fetch(url, {
-      headers: {
-        Authorization: `Bearer ${TOKEN}`,
-        Accept: "application/vnd.github+json",
-        "User-Agent": "rdrmap-vercel-api",
-      },
-    });
-
-    if (r.status === 404) {
-      return res.status(200).json({ ok: true, exists: false, payload: null });
+    const r = await gh(apiUrl, TOKEN);
+    if(r.status === 404){
+      return json(res, 200, { ok:true, mapId, payload:{ markers:[], roads:[], areas:[] } });
     }
-    if (!r.ok) {
+    if(!r.ok){
       const t = await r.text();
-      return res.status(500).json({ error: "GitHub load failed", details: t });
+      return json(res, 500, { error:"GitHub read failed", details:t });
     }
 
     const file = await r.json();
-    const raw = Buffer.from(String(file.content || "").replace(/\n/g, ""), "base64").toString("utf8");
-    const parsed = JSON.parse(raw);
+    const raw = Buffer.from(String(file.content||"").replace(/\n/g,""), "base64").toString("utf8");
 
-    // Supports either { payload: <data> } wrapper or direct data
-    const payload = parsed?.payload ?? parsed ?? null;
+    let parsed = {};
+    try{ parsed = JSON.parse(raw); }catch{}
+    const payload = parsed?.payload && typeof parsed.payload==="object" ? parsed.payload : parsed;
 
-    return res.status(200).json({ ok: true, exists: true, payload });
-  } catch (e) {
-    return res.status(500).json({ error: String(e?.message || e) });
+    return json(res, 200, { ok:true, mapId, payload });
+  }catch(e){
+    return json(res, 500, { error:String(e?.message||e) });
   }
 }
-
